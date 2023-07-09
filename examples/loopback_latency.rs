@@ -6,8 +6,10 @@ use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
+use raw_sync::Timeout::Infinite;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use latency_lab::shmem_lab::{ShmemReceiver, ShmemSender};
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]
 struct Message {
@@ -17,10 +19,11 @@ struct Message {
 
 fn main() {
     let iterations = 10000;
-    test("Ping local serde json            ", iterations, || PingLocalSerde);
+    test("json            ", iterations, || PingLocalSerde);
     // test("Ping loopback serde json w/flush ", iterations, || PingLoopbackSerde::new(true));
-    test("Ping loopback serde json wo/flush", iterations, || PingLoopbackSerde::new(false));
-    test("Ping loopback serde json pipes", iterations, || PingStdPipesSerde::new());
+    test("wo/flush", iterations, || PingLoopbackSerde::new(false));
+    // test("pipes   ", iterations, || PingStdPipesSerde::new());
+    test("shmem   ", iterations, || ShmemSerdePing::new("loopback_latency.shmem".to_string()));
 }
 
 fn test<T: Ping, F: FnOnce() -> T>(name: &str, iterations: usize, factory: F) {
@@ -174,4 +177,35 @@ fn read_u32_le<R: Read>(source: &mut R) -> std::io::Result<u32> {
 fn write_u32_le<W: Write>(target: &mut W, v: u32) {
     let n: [u8; 4] = v.to_le_bytes();
     target.write_all(&n).unwrap();
+}
+
+const MESSAGE_SHMEM_SIZE: usize = 512;
+
+struct ShmemSerdePing {
+    sender: ShmemSender<[u8; MESSAGE_SHMEM_SIZE]>,
+    receiver: ShmemReceiver<[u8; MESSAGE_SHMEM_SIZE]>,
+}
+
+impl ShmemSerdePing {
+    fn new(name: String) -> ShmemSerdePing {
+        ShmemSerdePing {
+            sender: ShmemSender::open(name.as_str()),
+            receiver: ShmemReceiver::open(name.as_str()),
+        }
+    }
+}
+
+impl Ping for ShmemSerdePing {
+    fn ping(&mut self, m: Message) -> Message {
+        let mut data = [0u8; MESSAGE_SHMEM_SIZE];
+        let json_string = serde_json::to_string(&m).unwrap();
+        let json = json_string.as_bytes();
+        write_u32_le(&mut &mut data[0..4], json.len() as u32);
+        data[4..json.len() + 4].copy_from_slice(json);
+        self.sender.send(data, Infinite).unwrap();
+        let response = self.receiver.receive(Infinite).unwrap();
+        let n = read_u32_le(&mut &response[0..4]).unwrap();
+
+        serde_json::from_slice(&response[4..(n as usize + 4)]).unwrap()
+    }
 }

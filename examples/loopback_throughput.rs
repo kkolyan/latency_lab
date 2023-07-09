@@ -1,18 +1,17 @@
 extern crate core;
 
-use std::collections::VecDeque;
 use std::hint::spin_loop;
-use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::ops::Deref;
-use std::str::from_utf8;
 use std::sync::mpsc::channel;
 use std::thread;
-use std::thread::{JoinHandle, sleep};
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
+use raw_sync::Timeout::Infinite;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thousands::Separable;
+use latency_lab::shmem_lab::{ShmemReceiver, ShmemSender};
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]
 struct Message {
@@ -28,6 +27,7 @@ fn main() {
     let iterations = 3000;
     //{"sent_at":{"secs_since_epoch":1688901474,"nanos_since_epoch":490919000}}
     test("Just ser+deser  ", iterations, || PingLocalSerde);
+    test("shmem           ", iterations, || ShmemSerdePing::new("loopback_thoughput.shmem".to_string()));
     // test("JSON + loopback async direct        ", iterations, || PingLoopbackSerde::new(true, false, None));
     // test("JSON + loopback async buffered      ", iterations, || PingLoopbackSerde::new(false, false, None));
     test("buffered unlim  ", iterations, || PingLoopbackSerde::new(buffering, true, None, transport_loopback()));
@@ -113,14 +113,14 @@ impl Ping for PingLocalSerde {
     }
 }
 
-struct PingLoopbackSerde<R: Read + MyClone, W: Write + MyClone> {
+struct PingLoopbackSerde<R, W> {
     transport: Transport<R, W>,
     flush: Buffering,
     sync: bool,
     produce_per_sec: Option<f64>,
 }
 
-struct Transport<R: Read + MyClone, W: Write + MyClone> {
+struct Transport<R, W> {
     client_socket: (R, W),
     server_socket: (R, W),
 }
@@ -439,4 +439,47 @@ fn read_u32_le<R: Read>(source: &mut R) -> std::io::Result<u32> {
 fn write_u32_le<W: Write>(target: &mut W, v: u32) -> std::io::Result<()> {
     let n: [u8; 4] = v.to_le_bytes();
     target.write_all(&n)
+}
+
+
+const MESSAGE_SHMEM_SIZE: usize = 512;
+
+struct ShmemSerdePing {
+    sender: ShmemSender<[u8; MESSAGE_SHMEM_SIZE]>,
+    receiver: ShmemReceiver<[u8; MESSAGE_SHMEM_SIZE]>,
+}
+
+impl ShmemSerdePing {
+    fn new(name: String) -> ShmemSerdePing {
+        ShmemSerdePing {
+            sender: ShmemSender::open(name.as_str()),
+            receiver: ShmemReceiver::open(name.as_str()),
+        }
+    }
+}
+
+impl ShmemSerdePing {
+
+    fn ping(&mut self, m: Message) -> Message {
+        let mut data = [0u8; MESSAGE_SHMEM_SIZE];
+        let json_string = serde_json::to_string(&m).unwrap();
+        let json = json_string.as_bytes();
+        write_u32_le(&mut &mut data[0..4], json.len() as u32);
+        data[4..json.len() + 4].copy_from_slice(json);
+        self.sender.send(data, Infinite).unwrap();
+        let response = self.receiver.receive(Infinite).unwrap();
+        let n = read_u32_le(&mut &response[0..4]).unwrap();
+
+        serde_json::from_slice(&response[4..(n as usize + 4)]).unwrap()
+    }
+
+}
+
+impl Ping for ShmemSerdePing {
+    fn do_job(&mut self, stats: &mut Vec<Duration>, iterations: usize) {
+        for i in 0..iterations {
+            let response = self.ping(Message { sent_at: SystemTime::now() });
+            stats.push(SystemTime::now().duration_since(response.sent_at).unwrap());
+        }
+    }
 }
