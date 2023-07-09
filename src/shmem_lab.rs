@@ -4,7 +4,8 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::SeqCst;
-use std::time::SystemTime;
+use std::thread::sleep;
+use std::time::{Duration, SystemTime};
 
 use raw_sync::Timeout;
 use shared_memory::{Shmem, ShmemConf, ShmemError};
@@ -35,7 +36,7 @@ impl<T> ShmemReceiver<T> {
         ShmemReceiver { pd: Default::default(), ctx: open_shmem(name, DEFAULT_SIZE) }
     }
 
-    pub fn receive(&self, timeout: Timeout) -> Result<T, ShmemLabError> {
+    pub fn receive(&self, timeout: Timeout, try_interval: Option<Duration>) -> Result<T, ShmemLabError> {
         let timeout_at = match timeout {
             Timeout::Infinite => None,
             Timeout::Val(dur) => Some(SystemTime::now() + dur)
@@ -47,6 +48,9 @@ impl<T> ShmemReceiver<T> {
                 if SystemTime::now() > at {
                     return Err(ShmemLabError::Timeout);
                 }
+            }
+            if let Some(d) = try_interval {
+                sleep(d);
             }
         }
         let value = unsafe {
@@ -67,7 +71,7 @@ impl<T> ShmemSender<T> {
         ShmemSender { pd: Default::default(), ctx: open_shmem(name, DEFAULT_SIZE) }
     }
 
-    pub fn send(&self, value: T, timeout: Timeout) -> Result<(), ShmemLabError> {
+    pub fn send(&self, value: T, timeout: Timeout, try_interval: Option<Duration>) -> Result<(), ShmemLabError> {
         let timeout_at = match timeout {
             Timeout::Infinite => None,
             Timeout::Val(dur) => Some(SystemTime::now() + dur)
@@ -77,6 +81,9 @@ impl<T> ShmemSender<T> {
             if let Some(at) = timeout_at {
                 if SystemTime::now() > at {
                     return Err(ShmemLabError::Timeout);
+                }
+                if let Some(d) = try_interval {
+                    sleep(d);
                 }
             }
         }

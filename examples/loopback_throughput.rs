@@ -30,7 +30,8 @@ fn main() {
     //{"sent_at":{"secs_since_epoch":1688901474,"nanos_since_epoch":490919000}}
     test("Just ser+deser  ", iterations, || PingLocalSerde);
     test("shmem in-process", iterations, || ShmemSerdePing::new_in_process("loopback_thoughput_shmem_in_process"));
-    test("shmem x-process ", iterations, || ShmemSerdePing::new("shmem_ping_server_input","shmem_ping_server_output"));
+    test("shmem x-process ", iterations, || ShmemSerdePing::new("shmem_ping_server_input","shmem_ping_server_output", None));
+    test("shmem x-p sleep ", iterations, || ShmemSerdePing::new("shmem_ping_server_input","shmem_ping_server_output", Some(Duration::from_nanos(1))));
     // test("JSON + loopback async direct        ", iterations, || PingLoopbackSerde::new(true, false, None));
     // test("JSON + loopback async buffered      ", iterations, || PingLoopbackSerde::new(false, false, None));
     test("buffered unlim  ", iterations, || PingLoopbackSerde::new(buffering, true, None, transport_loopback()));
@@ -438,6 +439,7 @@ const MESSAGE_SHMEM_SIZE: usize = 512;
 struct ShmemSerdePing {
     sender: ShmemSender<[u8; MESSAGE_SHMEM_SIZE]>,
     receiver: ShmemReceiver<[u8; MESSAGE_SHMEM_SIZE]>,
+    sleep: Option<Duration>,
 }
 
 impl ShmemSerdePing {
@@ -445,38 +447,24 @@ impl ShmemSerdePing {
         ShmemSerdePing {
             sender: ShmemSender::open(name),
             receiver: ShmemReceiver::open(name),
+            sleep: None,
         }
     }
-    fn new(send: &str, receive: &str) -> ShmemSerdePing {
+    fn new(send: &str, receive: &str, sleep: Option<Duration>) -> ShmemSerdePing {
         ShmemSerdePing {
             sender: ShmemSender::open(send),
             receiver: ShmemReceiver::open(receive),
+            sleep
         }
     }
 }
 
-impl ShmemSerdePing {
-
-    fn ping(&mut self, m: Message) -> Message {
-        let mut data = [0u8; MESSAGE_SHMEM_SIZE];
-        let json_string = serde_json::to_string(&m).unwrap();
-        let json = json_string.as_bytes();
-        write_u32_le(&mut &mut data[0..4], json.len() as u32).unwrap();
-        data[4..json.len() + 4].copy_from_slice(json);
-        self.sender.send(data, Infinite).unwrap();
-        let response = self.receiver.receive(Infinite).unwrap();
-        let n = read_u32_le(&mut &response[0..4]).unwrap();
-
-        serde_json::from_slice(&response[4..(n as usize + 4)]).unwrap()
-    }
-
-}
 
 impl Ping for ShmemSerdePing {
     fn do_job(&mut self, stats: &mut Vec<Duration>, iterations: usize) {
         for i in 0..iterations {
-            shmem_ping_send(&PingMessage::new(), &self.sender);
-            let response = shmem_ping_receive(&self.receiver);
+            shmem_ping_send(&PingMessage::new(), &self.sender, self.sleep);
+            let response = shmem_ping_receive(&self.receiver, self.sleep);
             stats.push(SystemTime::now().duration_since(response.sent_at).unwrap());
         }
     }
