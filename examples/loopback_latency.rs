@@ -3,19 +3,16 @@ extern crate core;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
+use std::str::from_utf8;
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 use raw_sync::Timeout::Infinite;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use latency_lab::shmem_lab::{ShmemReceiver, ShmemSender};
+use latency_lab::shmem_ping::{MESSAGE_SHMEM_SIZE, shmem_ping_receive, shmem_ping_send};
+use latency_lab::utils::PingMessage;
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
-struct Message {
-    index: u32,
-    sent: SystemTime,
-}
 
 fn main() {
     let iterations = 10000;
@@ -23,7 +20,10 @@ fn main() {
     // test("Ping loopback serde json w/flush ", iterations, || PingLoopbackSerde::new(true));
     test("wo/flush", iterations, || PingLoopbackSerde::new(false));
     // test("pipes   ", iterations, || PingStdPipesSerde::new());
-    test("shmem   ", iterations, || ShmemSerdePing::new("loopback_latency.shmem".to_string()));
+    test("shmem   ", iterations, || ShmemSerdePing::new(
+        "shmem_ping_server_input",
+        "shmem_ping_server_output"
+    ));
 }
 
 fn test<T: Ping, F: FnOnce() -> T>(name: &str, iterations: usize, factory: F) {
@@ -31,9 +31,9 @@ fn test<T: Ping, F: FnOnce() -> T>(name: &str, iterations: usize, factory: F) {
     let mut t = factory();
     for i in 0..iterations {
         let index = i as u32;
-        let result = t.ping(Message { sent: SystemTime::now(), index });
+        let result = t.ping(PingMessage { sent_at: SystemTime::now(), index });
         assert_eq!(result.index, index);
-        let lag = SystemTime::now().duration_since(result.sent).unwrap();
+        let lag = SystemTime::now().duration_since(result.sent_at).unwrap();
         stat.push(lag);
     }
     stat.sort();
@@ -48,15 +48,15 @@ fn test<T: Ping, F: FnOnce() -> T>(name: &str, iterations: usize, factory: F) {
 }
 
 trait Ping {
-    fn ping(&mut self, m: Message) -> Message;
+    fn ping(&mut self, m: PingMessage) -> PingMessage;
 }
 
-type Trait = dyn Fn(Message) -> Message;
+type Trait = dyn Fn(PingMessage) -> PingMessage;
 
 struct PingLocalSerde;
 
 impl Ping for PingLocalSerde {
-    fn ping(&mut self, m: Message) -> Message {
+    fn ping(&mut self, m: PingMessage) -> PingMessage {
         let json = serde_json::to_string(&m).unwrap();
         serde_json::from_str(json.as_str()).unwrap()
     }
@@ -120,7 +120,7 @@ fn spawn<T, F>(name: &str, f: F) -> JoinHandle<T>
 }
 
 impl Ping for PingLoopbackSerde {
-    fn ping(&mut self, m: Message) -> Message {
+    fn ping(&mut self, m: PingMessage) -> PingMessage {
         write_message(&mut self.client_socket, &m).unwrap();
         if self.flush {
             self.client_socket.flush();
@@ -129,14 +129,14 @@ impl Ping for PingLoopbackSerde {
     }
 }
 
-fn read_message<R: Read>(mut server_socket: &mut R) -> Result<Message, String> {
+fn read_message<R: Read>(mut server_socket: &mut R) -> Result<PingMessage, String> {
     let n = read_u32_le(&mut server_socket)
         .map_err(|e| e.to_string())?;
-    serde_json::from_reader::<_, Message>(server_socket.take(n.into()))
+    serde_json::from_reader::<_, PingMessage>(server_socket.take(n.into()))
         .map_err(|e| e.to_string())
 }
 
-fn write_message<W: Write>(mut server_socket: &mut W, m: &Message) -> std::io::Result<()> {
+fn write_message<W: Write>(mut server_socket: &mut W, m: &PingMessage) -> std::io::Result<()> {
     let json = serde_json::to_string(&m).unwrap();
     write_u32_le(&mut server_socket, json.len() as u32);
     server_socket.write_all(json.as_bytes())
@@ -162,7 +162,7 @@ impl PingStdPipesSerde {
 }
 
 impl Ping for PingStdPipesSerde {
-    fn ping(&mut self, m: Message) -> Message {
+    fn ping(&mut self, m: PingMessage) -> PingMessage {
         write_message(&mut self.stdin, &m).unwrap();
         read_message(&mut self.stdout).unwrap()
     }
@@ -179,33 +179,23 @@ fn write_u32_le<W: Write>(target: &mut W, v: u32) {
     target.write_all(&n).unwrap();
 }
 
-const MESSAGE_SHMEM_SIZE: usize = 512;
-
 struct ShmemSerdePing {
     sender: ShmemSender<[u8; MESSAGE_SHMEM_SIZE]>,
     receiver: ShmemReceiver<[u8; MESSAGE_SHMEM_SIZE]>,
 }
 
 impl ShmemSerdePing {
-    fn new(name: String) -> ShmemSerdePing {
+    fn new(send: &str, receive: &str) -> ShmemSerdePing {
         ShmemSerdePing {
-            sender: ShmemSender::open(name.as_str()),
-            receiver: ShmemReceiver::open(name.as_str()),
+            sender: ShmemSender::open(send),
+            receiver: ShmemReceiver::open(receive),
         }
     }
 }
 
 impl Ping for ShmemSerdePing {
-    fn ping(&mut self, m: Message) -> Message {
-        let mut data = [0u8; MESSAGE_SHMEM_SIZE];
-        let json_string = serde_json::to_string(&m).unwrap();
-        let json = json_string.as_bytes();
-        write_u32_le(&mut &mut data[0..4], json.len() as u32);
-        data[4..json.len() + 4].copy_from_slice(json);
-        self.sender.send(data, Infinite).unwrap();
-        let response = self.receiver.receive(Infinite).unwrap();
-        let n = read_u32_le(&mut &response[0..4]).unwrap();
-
-        serde_json::from_slice(&response[4..(n as usize + 4)]).unwrap()
+    fn ping(&mut self, m: PingMessage) -> PingMessage {
+        shmem_ping_send(&m, &self.sender);
+        shmem_ping_receive(&self.receiver)
     }
 }

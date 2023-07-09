@@ -12,6 +12,8 @@ use raw_sync::Timeout::Infinite;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thousands::Separable;
 use latency_lab::shmem_lab::{ShmemReceiver, ShmemSender};
+use latency_lab::shmem_ping::{shmem_ping_receive, shmem_ping_send};
+use latency_lab::utils::{PingMessage, read_u32_le, write_u32_le};
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]
 struct Message {
@@ -27,7 +29,8 @@ fn main() {
     let iterations = 3000;
     //{"sent_at":{"secs_since_epoch":1688901474,"nanos_since_epoch":490919000}}
     test("Just ser+deser  ", iterations, || PingLocalSerde);
-    test("shmem           ", iterations, || ShmemSerdePing::new("loopback_thoughput.shmem".to_string()));
+    test("shmem in-process", iterations, || ShmemSerdePing::new_in_process("loopback_thoughput_shmem_in_process"));
+    test("shmem x-process ", iterations, || ShmemSerdePing::new("shmem_ping_server_input","shmem_ping_server_output"));
     // test("JSON + loopback async direct        ", iterations, || PingLoopbackSerde::new(true, false, None));
     // test("JSON + loopback async buffered      ", iterations, || PingLoopbackSerde::new(false, false, None));
     test("buffered unlim  ", iterations, || PingLoopbackSerde::new(buffering, true, None, transport_loopback()));
@@ -430,18 +433,6 @@ fn write_message<W: Write>(mut server_socket: &mut W, m: &Message) -> std::io::R
     server_socket.write_all(json.as_bytes())
 }
 
-fn read_u32_le<R: Read>(source: &mut R) -> std::io::Result<u32> {
-    let mut n = [0u8; 4];
-    source.read_exact(&mut n)?;
-    Ok(u32::from_le_bytes(n))
-}
-
-fn write_u32_le<W: Write>(target: &mut W, v: u32) -> std::io::Result<()> {
-    let n: [u8; 4] = v.to_le_bytes();
-    target.write_all(&n)
-}
-
-
 const MESSAGE_SHMEM_SIZE: usize = 512;
 
 struct ShmemSerdePing {
@@ -450,10 +441,16 @@ struct ShmemSerdePing {
 }
 
 impl ShmemSerdePing {
-    fn new(name: String) -> ShmemSerdePing {
+    fn new_in_process(name: &str) -> ShmemSerdePing {
         ShmemSerdePing {
-            sender: ShmemSender::open(name.as_str()),
-            receiver: ShmemReceiver::open(name.as_str()),
+            sender: ShmemSender::open(name),
+            receiver: ShmemReceiver::open(name),
+        }
+    }
+    fn new(send: &str, receive: &str) -> ShmemSerdePing {
+        ShmemSerdePing {
+            sender: ShmemSender::open(send),
+            receiver: ShmemReceiver::open(receive),
         }
     }
 }
@@ -464,7 +461,7 @@ impl ShmemSerdePing {
         let mut data = [0u8; MESSAGE_SHMEM_SIZE];
         let json_string = serde_json::to_string(&m).unwrap();
         let json = json_string.as_bytes();
-        write_u32_le(&mut &mut data[0..4], json.len() as u32);
+        write_u32_le(&mut &mut data[0..4], json.len() as u32).unwrap();
         data[4..json.len() + 4].copy_from_slice(json);
         self.sender.send(data, Infinite).unwrap();
         let response = self.receiver.receive(Infinite).unwrap();
@@ -478,7 +475,8 @@ impl ShmemSerdePing {
 impl Ping for ShmemSerdePing {
     fn do_job(&mut self, stats: &mut Vec<Duration>, iterations: usize) {
         for i in 0..iterations {
-            let response = self.ping(Message { sent_at: SystemTime::now() });
+            shmem_ping_send(&PingMessage::new(), &self.sender);
+            let response = shmem_ping_receive(&self.receiver);
             stats.push(SystemTime::now().duration_since(response.sent_at).unwrap());
         }
     }
