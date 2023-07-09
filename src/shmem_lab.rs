@@ -31,33 +31,36 @@ pub enum ShmemLabError {
     Timeout
 }
 
+pub struct Success<T> {
+    pub value: T,
+    pub spin_count: u64,
+}
+
 impl<T> ShmemReceiver<T> {
     pub fn open(name: &str) -> ShmemReceiver<T> {
         ShmemReceiver { pd: Default::default(), ctx: open_shmem(name, DEFAULT_SIZE) }
     }
 
-    pub fn receive(&self, timeout: Timeout, try_interval: Option<Duration>) -> Result<T, ShmemLabError> {
+    pub fn receive(&self, timeout: Timeout) -> Result<Success<T>, ShmemLabError> {
         let timeout_at = match timeout {
             Timeout::Infinite => None,
             Timeout::Val(dur) => Some(SystemTime::now() + dur)
         };
-        let before = SystemTime::now();
         let state = unsafe { &mut *self.ctx.state };
+        let mut spin_count: u64 = 0;
         while state.load(SeqCst) != STATE_READY_TO_READ {
             if let Some(at) = timeout_at {
                 if SystemTime::now() > at {
                     return Err(ShmemLabError::Timeout);
                 }
             }
-            if let Some(d) = try_interval {
-                sleep(d);
-            }
+            spin_count += 1;
         }
         let value = unsafe {
             (self.ctx.data as *mut T).read()
         };
         state.store(STATE_READY_TO_WRITE, SeqCst);
-        Ok(value)
+        Ok(Success { value, spin_count })
     }
 }
 
@@ -66,30 +69,43 @@ pub struct ShmemSender<T> {
     ctx: ShmemCtx,
 }
 
+pub struct Stats {
+    pub send_spins: Vec<u64>,
+    pub receive_spins: Vec<u64>,
+}
+
 impl<T> ShmemSender<T> {
     pub fn open(name: &str) -> ShmemSender<T> {
         ShmemSender { pd: Default::default(), ctx: open_shmem(name, DEFAULT_SIZE) }
     }
 
-    pub fn send(&self, value: T, timeout: Timeout, try_interval: Option<Duration>) -> Result<(), ShmemLabError> {
+    pub fn send(&self, value: T, timeout: Timeout) -> Result<Success<()>, ShmemLabError> {
         let timeout_at = match timeout {
             Timeout::Infinite => None,
             Timeout::Val(dur) => Some(SystemTime::now() + dur)
         };
         let state = unsafe { &mut *self.ctx.state };
+        let mut spin_count = 0;
         while state.load(SeqCst) != STATE_READY_TO_WRITE {
             if let Some(at) = timeout_at {
                 if SystemTime::now() > at {
                     return Err(ShmemLabError::Timeout);
                 }
-                if let Some(d) = try_interval {
-                    sleep(d);
-                }
             }
+            spin_count += 1;
         }
         *unsafe { &mut *(self.ctx.data as *mut T) } = value;
         state.store(STATE_READY_TO_READ, SeqCst);
-        Ok(())
+        Ok(Success { value: (), spin_count })
+    }
+}
+
+fn do_sleep(d: Duration) {
+    let before = SystemTime::now();
+    sleep(d);
+    let spent = SystemTime::now().duration_since(before).unwrap();
+    if spent > d * 10 {
+        panic!("spent {:?} instead of {:?}", spent, d);
     }
 }
 

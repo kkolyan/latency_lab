@@ -11,7 +11,7 @@ use raw_sync::Timeout::Infinite;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thousands::Separable;
-use latency_lab::shmem_lab::{ShmemReceiver, ShmemSender};
+use latency_lab::shmem_lab::{ShmemReceiver, ShmemSender, Stats};
 use latency_lab::shmem_ping::{shmem_ping_receive, shmem_ping_send};
 use latency_lab::utils::{PingMessage, read_u32_le, write_u32_le};
 
@@ -26,12 +26,11 @@ fn main() {
     let batch_client = Duration::from_secs_f64(0.001);
     let batch_server = Duration::from_secs_f64(0.001);
     let buffering = Buffering::of(Some(batch_client), Some(batch_server));
-    let iterations = 3000;
+    let iterations = 12000;
     //{"sent_at":{"secs_since_epoch":1688901474,"nanos_since_epoch":490919000}}
     test("Just ser+deser  ", iterations, || PingLocalSerde);
     test("shmem in-process", iterations, || ShmemSerdePing::new_in_process("loopback_thoughput_shmem_in_process"));
-    test("shmem x-process ", iterations, || ShmemSerdePing::new("shmem_ping_server_input","shmem_ping_server_output", None));
-    test("shmem x-p sleep ", iterations, || ShmemSerdePing::new("shmem_ping_server_input","shmem_ping_server_output", Some(Duration::from_nanos(1))));
+    test("shmem x-process ", iterations, || ShmemSerdePing::new("shmem_ping_server_input", "shmem_ping_server_output"));
     // test("JSON + loopback async direct        ", iterations, || PingLoopbackSerde::new(true, false, None));
     // test("JSON + loopback async buffered      ", iterations, || PingLoopbackSerde::new(false, false, None));
     test("buffered unlim  ", iterations, || PingLoopbackSerde::new(buffering, true, None, transport_loopback()));
@@ -70,7 +69,7 @@ fn print_stats(name: &str, stat: &Vec<Duration>, total: Duration, message_per_se
     let pct95 = stat.get(((stat.len() as f64) * 0.95) as usize).unwrap();
     let pct05 = stat.get(((stat.len() as f64) * 0.05) as usize).unwrap();
     println!(
-        "{}: {: >12}..{: >12} | avg: {: >12} | med: {: >12} | pct-95: {: >12} | pct-05: {: >12} | rate/s: {:.2}",
+        "{}: {: >12}..{: >15} | avg: {: >12} | med: {: >12} | pct-95: {: >14} | pct-05: {: >12} | rate/s: {:.2}",
         name,
         min.as_nanos().separate_with_commas(),
         max.as_nanos().separate_with_commas(),
@@ -439,7 +438,6 @@ const MESSAGE_SHMEM_SIZE: usize = 512;
 struct ShmemSerdePing {
     sender: ShmemSender<[u8; MESSAGE_SHMEM_SIZE]>,
     receiver: ShmemReceiver<[u8; MESSAGE_SHMEM_SIZE]>,
-    sleep: Option<Duration>,
 }
 
 impl ShmemSerdePing {
@@ -447,14 +445,12 @@ impl ShmemSerdePing {
         ShmemSerdePing {
             sender: ShmemSender::open(name),
             receiver: ShmemReceiver::open(name),
-            sleep: None,
         }
     }
-    fn new(send: &str, receive: &str, sleep: Option<Duration>) -> ShmemSerdePing {
+    fn new(send: &str, receive: &str) -> ShmemSerdePing {
         ShmemSerdePing {
             sender: ShmemSender::open(send),
             receiver: ShmemReceiver::open(receive),
-            sleep
         }
     }
 }
@@ -462,10 +458,28 @@ impl ShmemSerdePing {
 
 impl Ping for ShmemSerdePing {
     fn do_job(&mut self, stats: &mut Vec<Duration>, iterations: usize) {
+        let mut shmem_stats = Stats { send_spins: vec![], receive_spins: vec![] };
         for i in 0..iterations {
-            shmem_ping_send(&PingMessage::new(), &self.sender, self.sleep);
-            let response = shmem_ping_receive(&self.receiver, self.sleep);
+            shmem_ping_send(&PingMessage::new(), &self.sender, Some(&mut shmem_stats));
+            let response = shmem_ping_receive(&self.receiver, Some(&mut shmem_stats));
             stats.push(SystemTime::now().duration_since(response.sent_at).unwrap());
         }
+
+        print_spin_stats("send", &mut shmem_stats.send_spins);
+        print_spin_stats("receive", &mut shmem_stats.receive_spins);
     }
+}
+
+fn print_spin_stats(kind: &str, spins: &mut Vec<u64>) {
+    spins.sort();
+    let sum: u64 = spins.iter().sum();
+    println!(
+        "↓ spins. type: {}. {}..{} avg: {}, med: {}, pct95: {}",
+        kind,
+        spins.first().unwrap(),
+        spins.last().unwrap(),
+        sum / spins.len() as u64,
+        spins.get(spins.len() / 2).unwrap(),
+        spins.get((spins.len() as f64 * 0.95) as usize).unwrap(),
+    )
 }
