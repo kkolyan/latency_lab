@@ -21,25 +21,26 @@ struct Message {
 }
 
 fn main() {
-    println!("Example: {}", serde_json::to_string(&Message {sent_at: SystemTime::now()}).unwrap());
+    println!("Example: {}", serde_json::to_string(&Message { sent_at: SystemTime::now() }).unwrap());
     let batch_client = Duration::from_secs_f64(0.001);
     let batch_server = Duration::from_secs_f64(0.001);
+    let buffering = Buffering::of(Some(batch_client), Some(batch_server));
     let iterations = 3000;
     //{"sent_at":{"secs_since_epoch":1688901474,"nanos_since_epoch":490919000}}
     test("Just ser+deser  ", iterations, || PingLocalSerde);
     // test("JSON + loopback async direct        ", iterations, || PingLoopbackSerde::new(true, false, None));
     // test("JSON + loopback async buffered      ", iterations, || PingLoopbackSerde::new(false, false, None));
-    test("buffered unlim  ", iterations, || PingLoopbackSerde::new(Buffering::of(Some(batch_client), Some(batch_server)), true, None));
-    test("buffered 20000/s", iterations, || PingLoopbackSerde::new(Buffering::of(Some(batch_client), Some(batch_server)), true, Some(20000.0)));
-    test("buffered 10000/s", iterations, || PingLoopbackSerde::new(Buffering::of(Some(batch_client), Some(batch_server)), true, Some(10000.0)));
-    test("buffered 5000/s ", iterations, || PingLoopbackSerde::new(Buffering::of(Some(batch_client), Some(batch_server)), true, Some(5000.0)));
-    test("buffered 2000/s ", iterations, || PingLoopbackSerde::new(Buffering::of(Some(batch_client), Some(batch_server)), true, Some(2000.0)));
+    test("buffered unlim  ", iterations, || PingLoopbackSerde::new(buffering, true, None, transport_loopback()));
+    test("buffered 20000/s", iterations, || PingLoopbackSerde::new(buffering, true, Some(20000.0), transport_loopback()));
+    test("buffered 10000/s", iterations, || PingLoopbackSerde::new(buffering, true, Some(10000.0), transport_loopback()));
+    test("buffered 5000/s ", iterations, || PingLoopbackSerde::new(buffering, true, Some(5000.0), transport_loopback()));
+    test("buffered 2000/s ", iterations, || PingLoopbackSerde::new(buffering, true, Some(2000.0), transport_loopback()));
     // test("JSON + loopback buffered 200/s ", iterations, || PingLoopbackSerde::new(false, true, Some(200.0)));
-    test("direct unlim    ", iterations, || PingLoopbackSerde::new(Buffering::empty(), true, None));
-    test("direct 20000/s  ", iterations, || PingLoopbackSerde::new(Buffering::empty(), true, Some(20000.0)));
-    test("direct 10000/s  ", iterations, || PingLoopbackSerde::new(Buffering::empty(), true, Some(10000.0)));
-    test("direct 5000/s   ", iterations, || PingLoopbackSerde::new(Buffering::empty(), true, Some(5000.0)));
-    test("direct 2000/s   ", iterations, || PingLoopbackSerde::new(Buffering::empty(), true, Some(2000.0)));
+    test("direct unlim    ", iterations, || PingLoopbackSerde::new(Buffering::empty(), true, None, transport_loopback()));
+    test("direct 20000/s  ", iterations, || PingLoopbackSerde::new(Buffering::empty(), true, Some(20000.0), transport_loopback()));
+    test("direct 10000/s  ", iterations, || PingLoopbackSerde::new(Buffering::empty(), true, Some(10000.0), transport_loopback()));
+    test("direct 5000/s   ", iterations, || PingLoopbackSerde::new(Buffering::empty(), true, Some(5000.0), transport_loopback()));
+    test("direct 2000/s   ", iterations, || PingLoopbackSerde::new(Buffering::empty(), true, Some(2000.0), transport_loopback()));
 }
 
 fn test<T: Ping, F: FnOnce() -> T>(name: &str, iterations: u32, factory: F) {
@@ -83,6 +84,7 @@ trait Ping {
 
 type Trait = dyn Fn(Message) -> Message;
 
+#[derive(Copy, Clone)]
 struct Buffering {
     client: Option<Duration>,
     server: Option<Duration>,
@@ -111,13 +113,16 @@ impl Ping for PingLocalSerde {
     }
 }
 
-struct PingLoopbackSerde {
-    client_socket: TcpStream,
-    server_socket: TcpStream,
-    server_instance: TcpListener,
+struct PingLoopbackSerde<R: Read + MyClone, W: Write + MyClone> {
+    transport: Transport<R, W>,
     flush: Buffering,
     sync: bool,
     produce_per_sec: Option<f64>,
+}
+
+struct Transport<R: Read + MyClone, W: Write + MyClone> {
+    client_socket: (R, W),
+    server_socket: (R, W),
 }
 
 #[derive(Clone)]
@@ -131,32 +136,68 @@ enum WriteNext {
     Text(Box<[u8]>),
 }
 
-impl PingLoopbackSerde {
-    fn new(flush: Buffering, sync: bool, produce_per_sec: Option<f64>) -> Self {
+trait MyClone {
+    fn my_clone(&self) -> Self;
+}
+
+impl MyClone for TcpStream {
+    fn my_clone(&self) -> Self {
+        self.try_clone().unwrap()
+    }
+}
+
+impl<R: MyClone, W: MyClone> MyClone for (R, W) {
+    fn my_clone(&self) -> Self {
+        let (r, w) = self;
+        (r.my_clone(), w.my_clone())
+    }
+}
+
+impl<R: Read + MyClone, W: Write + MyClone> MyClone for Transport<R, W> {
+    fn my_clone(&self) -> Self {
+        Transport {
+            client_socket: self.client_socket.my_clone(),
+            server_socket: self.server_socket.my_clone(),
+        }
+    }
+}
+
+fn transport_loopback() -> Transport<TcpStream, TcpStream> {
+    let addr = "localhost:8080";
+    let server_instance = TcpListener::bind(addr).unwrap();
+
+    let client_socket = spawn("connect", move || {
+        TcpStream::connect(addr).unwrap()
+    });
+
+    let server_socket = {
+        let server_instance = server_instance.try_clone().unwrap();
+        spawn("accept", move || {
+            server_instance.accept().unwrap().0
+        })
+    };
+
+    let client_socket = client_socket.join().unwrap();
+    let server_socket = server_socket.join().unwrap();
+
+    Transport {
+        client_socket: (client_socket.my_clone(), client_socket),
+        server_socket: (server_socket.my_clone(), server_socket),
+    }
+}
+
+impl<R: Read + MyClone + Send + 'static, W: Write + MyClone + Send + 'static> PingLoopbackSerde<R, W> {
+    fn new(flush: Buffering, sync: bool, produce_per_sec: Option<f64>, transport: Transport<R, W>) -> Self {
         if !sync && produce_per_sec.is_some() {
             todo!();
         }
-        let addr = "localhost:8080";
-        let server_instance = TcpListener::bind(addr).unwrap();
 
-        let client_socket = spawn("connect", move || {
-            TcpStream::connect(addr).unwrap()
-        });
-
-        let server_socket = {
-            let server_instance = server_instance.try_clone().unwrap();
-            spawn("accept", move || {
-                server_instance.accept().unwrap().0
-            })
-        };
-
-        let client_socket = client_socket.join().unwrap();
-        let server_socket = server_socket.join().unwrap();
+        let (reader, writer) = &transport.server_socket;
 
         if let Some(buffering) = flush.server {
             let (sender, receiver) = channel::<Message>();
             {
-                let mut server_socket = server_socket.try_clone().unwrap();
+                let mut server_socket = reader.my_clone();
                 spawn("pump reader", move || {
                     loop {
                         let result = read_message(&mut server_socket);
@@ -167,7 +208,7 @@ impl PingLoopbackSerde {
                 });
             }
             {
-                let mut server_socket = server_socket.try_clone().unwrap();
+                let mut server_socket = writer.my_clone();
                 spawn("pump writer", move || {
                     let mut batch = Vec::new();
                     let mut next_flush = SystemTime::now() + buffering;
@@ -190,12 +231,13 @@ impl PingLoopbackSerde {
                 });
             }
         } else {
-            let mut server_socket = server_socket.try_clone().unwrap();
+            let mut reader = reader.my_clone();
+            let mut writer = writer.my_clone();
             spawn("pump", move || {
                 loop {
-                    let result = read_message(&mut server_socket);
+                    let result = read_message(&mut reader);
                     if let Ok(m) = result {
-                        if write_message(&mut server_socket, &m).is_err() || server_socket.flush().is_err() {
+                        if write_message(&mut writer, &m).is_err() || writer.flush().is_err() {
                             println!("thread pump finished job");
                             break;
                         }
@@ -203,12 +245,9 @@ impl PingLoopbackSerde {
                 }
             });
         }
-        client_socket.set_nonblocking(!sync).unwrap();
 
         PingLoopbackSerde {
-            client_socket,
-            server_socket,
-            server_instance,
+            transport,
             flush,
             sync,
             produce_per_sec,
@@ -216,7 +255,7 @@ impl PingLoopbackSerde {
     }
 
     fn do_job_sync(&mut self, stats: &mut Vec<Duration>, iterations: usize) {
-        let mut client_socket = BufReader::new(self.client_socket.try_clone().unwrap());
+        let mut client_socket = BufReader::new(self.transport.client_socket.0.my_clone());
         let responses = spawn("read responses", move || {
             let mut stats: Vec<Duration> = Vec::new();
             let buf = &mut [0u8; 64 * 1024];
@@ -233,7 +272,7 @@ impl PingLoopbackSerde {
         });
 
         let mut rem = iterations;
-        let mut writer = BufWriter::new(&mut self.client_socket);
+        let mut writer = BufWriter::new(&mut self.transport.client_socket.1);
         let sleep_secs = self.produce_per_sec.map(|it| 1.0 / it);
         let mut next_flush = self.flush.client.map(|it| SystemTime::now() + it);
         while rem > 0 {
@@ -368,7 +407,7 @@ fn spawn<T, F>(name: &str, f: F) -> JoinHandle<T>
     thread::Builder::new().name(name.into()).spawn(f).unwrap()
 }
 
-impl Ping for PingLoopbackSerde {
+impl<R: Read + MyClone + Send + 'static, W: Write + MyClone + Send + 'static> Ping for PingLoopbackSerde<R, W> {
     fn do_job(&mut self, stats: &mut Vec<Duration>, iterations: usize) {
         if self.sync {
             self.do_job_sync(stats, iterations);
