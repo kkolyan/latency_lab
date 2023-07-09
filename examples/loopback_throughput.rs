@@ -1,16 +1,18 @@
 extern crate core;
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::hint::spin_loop;
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::ops::Deref;
 use std::str::from_utf8;
 use std::sync::mpsc::channel;
 use std::thread;
-use std::thread::JoinHandle;
+use std::thread::{JoinHandle, sleep};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use thousands::Separable;
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]
 struct Message {
@@ -19,11 +21,25 @@ struct Message {
 }
 
 fn main() {
-    let iterations = 10000;
-    test("Ping local serde json                 ", iterations, || PingLocalSerde);
-    test("Ping loopback serde json w/flush      ", iterations, || PingLoopbackSerde::new(true, false));
-    test("Ping loopback serde json wo/flush     ", iterations, || PingLoopbackSerde::new(false, false));
-    test("Ping loopback serde json wo/flush sync", iterations, || PingLoopbackSerde::new(false, true));
+    println!("Example: {}", serde_json::to_string(&Message {sent_at: SystemTime::now()}).unwrap());
+    let batch_client = Duration::from_secs_f64(0.001);
+    let batch_server = Duration::from_secs_f64(0.001);
+    let iterations = 3000;
+    //{"sent_at":{"secs_since_epoch":1688901474,"nanos_since_epoch":490919000}}
+    test("Just ser+deser  ", iterations, || PingLocalSerde);
+    // test("JSON + loopback async direct        ", iterations, || PingLoopbackSerde::new(true, false, None));
+    // test("JSON + loopback async buffered      ", iterations, || PingLoopbackSerde::new(false, false, None));
+    test("buffered unlim  ", iterations, || PingLoopbackSerde::new(Buffering::of(Some(batch_client), Some(batch_server)), true, None));
+    test("buffered 20000/s", iterations, || PingLoopbackSerde::new(Buffering::of(Some(batch_client), Some(batch_server)), true, Some(20000.0)));
+    test("buffered 10000/s", iterations, || PingLoopbackSerde::new(Buffering::of(Some(batch_client), Some(batch_server)), true, Some(10000.0)));
+    test("buffered 5000/s ", iterations, || PingLoopbackSerde::new(Buffering::of(Some(batch_client), Some(batch_server)), true, Some(5000.0)));
+    test("buffered 2000/s ", iterations, || PingLoopbackSerde::new(Buffering::of(Some(batch_client), Some(batch_server)), true, Some(2000.0)));
+    // test("JSON + loopback buffered 200/s ", iterations, || PingLoopbackSerde::new(false, true, Some(200.0)));
+    test("direct unlim    ", iterations, || PingLoopbackSerde::new(Buffering::empty(), true, None));
+    test("direct 20000/s  ", iterations, || PingLoopbackSerde::new(Buffering::empty(), true, Some(20000.0)));
+    test("direct 10000/s  ", iterations, || PingLoopbackSerde::new(Buffering::empty(), true, Some(10000.0)));
+    test("direct 5000/s   ", iterations, || PingLoopbackSerde::new(Buffering::empty(), true, Some(5000.0)));
+    test("direct 2000/s   ", iterations, || PingLoopbackSerde::new(Buffering::empty(), true, Some(2000.0)));
 }
 
 fn test<T: Ping, F: FnOnce() -> T>(name: &str, iterations: u32, factory: F) {
@@ -48,7 +64,17 @@ fn print_stats(name: &str, stat: &Vec<Duration>, total: Duration, message_per_se
     let med = stat.get(stat.len() / 2).unwrap();
     let pct95 = stat.get(((stat.len() as f64) * 0.95) as usize).unwrap();
     let pct05 = stat.get(((stat.len() as f64) * 0.05) as usize).unwrap();
-    println!("Test \"{}\": {}..{}, avg: {}, med: {}, pct-95: {}, pct-05: {}, total: {}, rate/s: {}", name, min.as_nanos(), max.as_nanos(), avg.as_nanos(), med.as_nanos(), pct95.as_nanos(), pct05.as_nanos(), total.as_nanos(), message_per_sec);
+    println!(
+        "{}: {: >12}..{: >12} | avg: {: >12} | med: {: >12} | pct-95: {: >12} | pct-05: {: >12} | rate/s: {:.2}",
+        name,
+        min.as_nanos().separate_with_commas(),
+        max.as_nanos().separate_with_commas(),
+        avg.as_nanos().separate_with_commas(),
+        med.as_nanos().separate_with_commas(),
+        pct95.as_nanos().separate_with_commas(),
+        pct05.as_nanos().separate_with_commas(),
+        message_per_sec
+    );
 }
 
 trait Ping {
@@ -56,6 +82,21 @@ trait Ping {
 }
 
 type Trait = dyn Fn(Message) -> Message;
+
+struct Buffering {
+    client: Option<Duration>,
+    server: Option<Duration>,
+}
+
+impl Buffering {
+    fn empty() -> Self {
+        Buffering { client: None, server: None }
+    }
+
+    fn of(client: Option<Duration>, server: Option<Duration>) -> Self {
+        Buffering { client, server }
+    }
+}
 
 struct PingLocalSerde;
 
@@ -74,8 +115,9 @@ struct PingLoopbackSerde {
     client_socket: TcpStream,
     server_socket: TcpStream,
     server_instance: TcpListener,
-    flush: bool,
+    flush: Buffering,
     sync: bool,
+    produce_per_sec: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -90,7 +132,10 @@ enum WriteNext {
 }
 
 impl PingLoopbackSerde {
-    fn new(flush: bool, sync: bool) -> Self {
+    fn new(flush: Buffering, sync: bool, produce_per_sec: Option<f64>) -> Self {
+        if !sync && produce_per_sec.is_some() {
+            todo!();
+        }
         let addr = "localhost:8080";
         let server_instance = TcpListener::bind(addr).unwrap();
 
@@ -108,13 +153,49 @@ impl PingLoopbackSerde {
         let client_socket = client_socket.join().unwrap();
         let server_socket = server_socket.join().unwrap();
 
-        {
+        if let Some(buffering) = flush.server {
+            let (sender, receiver) = channel::<Message>();
+            {
+                let mut server_socket = server_socket.try_clone().unwrap();
+                spawn("pump reader", move || {
+                    loop {
+                        let result = read_message(&mut server_socket);
+                        if let Ok(m) = result {
+                            sender.send(m).unwrap();
+                        }
+                    }
+                });
+            }
+            {
+                let mut server_socket = server_socket.try_clone().unwrap();
+                spawn("pump writer", move || {
+                    let mut batch = Vec::new();
+                    let mut next_flush = SystemTime::now() + buffering;
+                    loop {
+                        for m in receiver.try_iter() {
+                            batch.push(m);
+                        }
+                        let now = SystemTime::now();
+                        if now >= next_flush {
+                            next_flush = now + buffering;
+                            for m in batch.iter() {
+                                if write_message(&mut server_socket, m).is_err() || server_socket.flush().is_err() {
+                                    // println!("thread pump writer finished job");
+                                    return;
+                                }
+                            }
+                            batch.clear();
+                        }
+                    }
+                });
+            }
+        } else {
             let mut server_socket = server_socket.try_clone().unwrap();
             spawn("pump", move || {
                 loop {
-                    let result = Self::read_message(&mut server_socket);
+                    let result = read_message(&mut server_socket);
                     if let Ok(m) = result {
-                        if Self::write_message(&mut server_socket, &m).is_err() || (flush && server_socket.flush().is_err()) {
+                        if write_message(&mut server_socket, &m).is_err() || server_socket.flush().is_err() {
                             println!("thread pump finished job");
                             break;
                         }
@@ -130,11 +211,12 @@ impl PingLoopbackSerde {
             server_instance,
             flush,
             sync,
+            produce_per_sec,
         }
     }
 
     fn do_job_sync(&mut self, stats: &mut Vec<Duration>, iterations: usize) {
-        let mut client_socket = self.client_socket.try_clone().unwrap();
+        let mut client_socket = BufReader::new(self.client_socket.try_clone().unwrap());
         let responses = spawn("read responses", move || {
             let mut stats: Vec<Duration> = Vec::new();
             let buf = &mut [0u8; 64 * 1024];
@@ -151,107 +233,131 @@ impl PingLoopbackSerde {
         });
 
         let mut rem = iterations;
+        let mut writer = BufWriter::new(&mut self.client_socket);
+        let sleep_secs = self.produce_per_sec.map(|it| 1.0 / it);
+        let mut next_flush = self.flush.client.map(|it| SystemTime::now() + it);
         while rem > 0 {
             let m = Message { sent_at: SystemTime::now() };
             let string = serde_json::to_string(&m).unwrap();
             let data = string.as_bytes();
-            write_u32_le(&mut self.client_socket, data.len() as u32).unwrap();
-            self.client_socket.write_all(data).unwrap();
+            write_u32_le(&mut writer, data.len() as u32).unwrap();
+            writer.write_all(data).unwrap();
+            if let Some(delay) = self.flush.client {
+                let now = SystemTime::now();
+                if now > next_flush.unwrap() {
+                    writer.flush().unwrap();
+                    next_flush = Some(now + delay)
+                }
+            } else {
+                writer.flush().unwrap();
+            }
             rem -= 1;
+            if let Some(sleep_secs) = sleep_secs {
+                sleep_spin(Duration::from_secs_f64(sleep_secs));
+            }
         }
+        writer.flush().unwrap();
 
 
         *stats = responses.join().unwrap();
     }
 
     fn do_job_async(&mut self, stats: &mut Vec<Duration>, iterations: usize) {
-        let buffer: &mut [u8] = &mut [0u8; 65 * 1024];
+        todo!()
+        // let buffer: &mut [u8] = &mut [0u8; 65 * 1024];
+        //
+        // let mut reads_rem = iterations;
+        // let mut writes_rem = iterations;
+        // let mut read_next_length: Option<u32> = None;
+        // let mut write_next: Option<WriteNext> = None;
+        //
+        // while reads_rem > 0 || writes_rem > 0 {
+        //     'read:
+        //     while reads_rem > 0 {
+        //         match read_next_length {
+        //             Some(n) => {
+        //                 let buf = &mut buffer[0..(n as usize)];
+        //                 match self.client_socket.read_exact(buf) {
+        //                     Ok(_) => {
+        //                         let m: Message = serde_json::from_slice(buf).unwrap_or_else(|_| panic!("failed to parse {}", from_utf8(buf).unwrap()));
+        //                         stats.push(SystemTime::now().duration_since(m.sent_at).unwrap());
+        //                         reads_rem -= 1;
+        //                         read_next_length = None;
+        //                     }
+        //                     Err(e) => {
+        //                         if e.kind() == ErrorKind::WouldBlock {
+        //                             break 'read;
+        //                         }
+        //                         panic!("read body error: {}", e);
+        //                     }
+        //                 };
+        //             }
+        //             None => {
+        //                 match read_u32_le(&mut self.client_socket) {
+        //                     Ok(n) => read_next_length = Some(n),
+        //                     Err(e) => {
+        //                         if e.kind() == ErrorKind::WouldBlock {
+        //                             break 'read;
+        //                         }
+        //                         panic!("read length error: {}", e);
+        //                     }
+        //                 };
+        //             }
+        //         }
+        //     }
+        //
+        //     'write:
+        //     while writes_rem > 0 {
+        //         write_next = match write_next.take() {
+        //             None => {
+        //                 let m = Message { sent_at: SystemTime::now() };
+        //                 let json = serde_json::to_string(&m).unwrap();
+        //                 Some(WriteNext::Length(json.into_boxed_str().into_boxed_bytes()))
+        //             }
+        //             Some(it) => match it {
+        //                 WriteNext::Length(s) => {
+        //                     match write_u32_le(&mut self.client_socket, s.len() as u32) {
+        //                         Ok(_) => {
+        //                             Some(WriteNext::Text(s))
+        //                         }
+        //                         Err(e) => {
+        //                             if e.kind() == ErrorKind::WouldBlock {
+        //                                 write_next = Some(WriteNext::Length(s));
+        //                                 break 'write;
+        //                             }
+        //                             panic!("write length error: {}", e);
+        //                         }
+        //                     }
+        //                 }
+        //                 WriteNext::Text(s) => {
+        //                     match self.client_socket.write_all(s.deref()) {
+        //                         Ok(_) => {
+        //                             if self.flush {
+        //                                 self.client_socket.flush();
+        //                             }
+        //                             writes_rem -= 1;
+        //                             None
+        //                         }
+        //                         Err(e) => {
+        //                             if e.kind() == ErrorKind::WouldBlock {
+        //                                 write_next = Some(WriteNext::Text(s));
+        //                                 break 'write;
+        //                             }
+        //                             panic!("write body error: {}", e);
+        //                         }
+        //                     }
+        //                 }
+        //             }
+        //         };
+        //     }
+        // }
+    }
+}
 
-        let mut reads_rem = iterations;
-        let mut writes_rem = iterations;
-        let mut read_next_length: Option<u32> = None;
-        let mut write_next: Option<WriteNext> = None;
-
-        while reads_rem > 0 || writes_rem > 0 {
-            'read:
-            while reads_rem > 0 {
-                match read_next_length {
-                    Some(n) => {
-                        let buf = &mut buffer[0..(n as usize)];
-                        match self.client_socket.read_exact(buf) {
-                            Ok(_) => {
-                                let m: Message = serde_json::from_slice(buf).unwrap_or_else(|_| panic!("failed to parse {}", from_utf8(buf).unwrap()));
-                                stats.push(SystemTime::now().duration_since(m.sent_at).unwrap());
-                                reads_rem -= 1;
-                                read_next_length = None;
-                            }
-                            Err(e) => {
-                                if e.kind() == ErrorKind::WouldBlock {
-                                    break 'read;
-                                }
-                                panic!("read body error: {}", e);
-                            }
-                        };
-                    }
-                    None => {
-                        match read_u32_le(&mut self.client_socket) {
-                            Ok(n) => read_next_length = Some(n),
-                            Err(e) => {
-                                if e.kind() == ErrorKind::WouldBlock {
-                                    break 'read;
-                                }
-                                panic!("read length error: {}", e);
-                            }
-                        };
-                    }
-                }
-            }
-
-            'write:
-            while writes_rem > 0 {
-                write_next = match write_next.take() {
-                    None => {
-                        let m = Message { sent_at: SystemTime::now() };
-                        let json = serde_json::to_string(&m).unwrap();
-                        Some(WriteNext::Length(json.into_boxed_str().into_boxed_bytes()))
-                    }
-                    Some(it) => match it {
-                        WriteNext::Length(s) => {
-                            match write_u32_le(&mut self.client_socket, s.len() as u32) {
-                                Ok(_) => {
-                                    Some(WriteNext::Text(s))
-                                }
-                                Err(e) => {
-                                    if e.kind() == ErrorKind::WouldBlock {
-                                        write_next = Some(WriteNext::Length(s));
-                                        break 'write;
-                                    }
-                                    panic!("write length error: {}", e);
-                                }
-                            }
-                        }
-                        WriteNext::Text(s) => {
-                            match self.client_socket.write_all(s.deref()) {
-                                Ok(_) => {
-                                    if self.flush {
-                                        self.client_socket.flush();
-                                    }
-                                    writes_rem -= 1;
-                                    None
-                                }
-                                Err(e) => {
-                                    if e.kind() == ErrorKind::WouldBlock {
-                                        write_next = Some(WriteNext::Text(s));
-                                        break 'write;
-                                    }
-                                    panic!("write body error: {}", e);
-                                }
-                            }
-                        }
-                    }
-                };
-            }
-        }
+fn sleep_spin(duration: Duration) {
+    let before = SystemTime::now();
+    while SystemTime::now().duration_since(before).unwrap() < duration {
+        spin_loop();
     }
 }
 
@@ -272,19 +378,17 @@ impl Ping for PingLoopbackSerde {
     }
 }
 
-impl PingLoopbackSerde {
-    fn read_message(mut server_socket: &mut TcpStream) -> Result<Message, String> {
-        let n = read_u32_le(&mut server_socket)
-            .map_err(|e| e.to_string())?;
-        serde_json::from_reader::<_, Message>(server_socket.take(n.into()))
-            .map_err(|e| e.to_string())
-    }
+fn read_message<R: Read>(mut server_socket: &mut R) -> Result<Message, String> {
+    let n = read_u32_le(&mut server_socket)
+        .map_err(|e| e.to_string())?;
+    serde_json::from_reader::<_, Message>(server_socket.take(n.into()))
+        .map_err(|e| e.to_string())
+}
 
-    fn write_message(mut server_socket: &mut TcpStream, m: &Message) -> std::io::Result<()> {
-        let json = serde_json::to_string(&m).unwrap();
-        write_u32_le(&mut server_socket, json.len() as u32);
-        server_socket.write_all(json.as_bytes())
-    }
+fn write_message<W: Write>(mut server_socket: &mut W, m: &Message) -> std::io::Result<()> {
+    let json = serde_json::to_string(&m).unwrap();
+    write_u32_le(&mut server_socket, json.len() as u32);
+    server_socket.write_all(json.as_bytes())
 }
 
 fn read_u32_le<R: Read>(source: &mut R) -> std::io::Result<u32> {
