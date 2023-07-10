@@ -23,6 +23,7 @@ struct ShmemCtx {
 
 const DEFAULT_SIZE: usize = 64 * 1024;
 
+const STATE_ZERO: u64 = 0;
 const STATE_READY_TO_WRITE: u64 = 2;
 const STATE_READY_TO_READ: u64 = 3;
 
@@ -134,6 +135,9 @@ fn open_shmem(name: &str, size: usize) -> ShmemCtx {
         }
         if state_before == STATE_READY_TO_WRITE {
             break;
+        }
+        if state_before != STATE_ZERO {
+            panic!("shared memory is dirty");
         }
         if state.compare_exchange(state_before, STATE_READY_TO_WRITE, SeqCst, SeqCst).is_ok() {
             break;
