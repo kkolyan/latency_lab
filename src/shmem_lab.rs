@@ -1,7 +1,7 @@
-
-
-use std::marker::PhantomData;
-use std::path::Path;
+use std::backtrace::Backtrace;
+use std::io::{stdout, Write};
+use std::mem;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::SeqCst;
 use std::thread::sleep;
@@ -10,64 +10,179 @@ use std::time::{Duration, SystemTime};
 use raw_sync::Timeout;
 use shared_memory::{Shmem, ShmemConf, ShmemError};
 
+const BACKTRACE_STUCK_SECS: f64 = 3.0;
+
 pub struct ShmemReceiver<T> {
-    pd: PhantomData<T>,
-    ctx: ShmemCtx,
+    ctx: ShmemCtx<T>,
 }
 
-struct ShmemCtx {
+pub struct ShmemCtx<T> {
     shmem: Shmem,
     state: *mut AtomicU64,
-    data: *mut u8,
+    pub data: *mut T,
+    size: usize,
+    invalid: bool,
 }
 
 const DEFAULT_SIZE: usize = 64 * 1024;
 
 const STATE_ZERO: u64 = 0;
-const STATE_READY_TO_WRITE: u64 = 2;
+const STATE_READY_TO_WRITE: u64 = 1;
+const STATE_WRITING: u64 = 2;
 const STATE_READY_TO_READ: u64 = 3;
+const STATE_READING: u64 = 4;
 
 #[derive(Copy, Clone, Debug)]
 pub enum ShmemLabError {
-    Timeout
+    Timeout,
+    ConcurrentAccessDetected,
+    Invalid,
 }
 
-pub struct Success<T> {
+pub struct SpinResult<T> {
     pub value: T,
     pub spin_count: u64,
 }
 
-impl<T> ShmemReceiver<T> {
+impl<T: Copy> ShmemReceiver<T> {
     pub fn open(name: &str) -> ShmemReceiver<T> {
-        ShmemReceiver { pd: Default::default(), ctx: open_shmem(name, DEFAULT_SIZE) }
+        ShmemReceiver { ctx: open_shmem(name) }
     }
 
-    pub fn receive(&self, timeout: Timeout) -> Result<Success<T>, ShmemLabError> {
+    pub fn begin(&mut self, timeout: Timeout) -> SpinResult<Result<ShmemReceive<T>, ShmemLabError>> {
+        if self.ctx.invalid {
+            return SpinResult { value: Err(ShmemLabError::Invalid), spin_count: 0 };
+        }
         let timeout_at = match timeout {
             Timeout::Infinite => None,
             Timeout::Val(dur) => Some(SystemTime::now() + dur)
         };
         let state = unsafe { &mut *self.ctx.state };
         let mut spin_count: u64 = 0;
-        while state.load(SeqCst) != STATE_READY_TO_READ {
+        let mut backtrace_at = Some(SystemTime::now() + Duration::from_secs_f64(BACKTRACE_STUCK_SECS));
+        loop {
+            let curr_state = state.load(SeqCst);
+            if curr_state == STATE_READY_TO_READ {
+                break;
+            }
             if let Some(at) = timeout_at {
                 if SystemTime::now() > at {
-                    return Err(ShmemLabError::Timeout);
+                    return SpinResult {
+                        value: Err(ShmemLabError::Timeout),
+                        spin_count,
+                    };
                 }
             }
+
+            if spin_count % 10000 == 0 {
+                let backtrace = if let Some(backtrace_at) = &backtrace_at {
+                    SystemTime::now() > *backtrace_at
+                } else { false };
+                if backtrace {
+                    println!("stuck at {}:\n{}", curr_state, Backtrace::capture());
+                    backtrace_at = None;
+                }
+            }
+
             spin_count += 1;
         }
-        let value = unsafe {
-            (self.ctx.data as *mut T).read()
-        };
-        state.store(STATE_READY_TO_WRITE, SeqCst);
-        Ok(Success { value, spin_count })
+
+        SpinResult {
+            value: match state.compare_exchange(STATE_READY_TO_READ, STATE_READING, SeqCst, SeqCst) {
+                Ok(_) => Ok(ShmemReceive { ctx: &mut self.ctx, closed: false }),
+                Err(..) => Err(ShmemLabError::ConcurrentAccessDetected),
+            },
+            spin_count,
+        }
+    }
+}
+
+pub struct ShmemReceive<'a, T> {
+    ctx: &'a mut ShmemCtx<T>,
+    closed: bool,
+}
+
+impl<'a, T> ShmemReceive<'a, T> {
+    pub fn end(mut self) -> Result<(), ShmemLabError> {
+        if self.ctx.invalid {
+            return Err(ShmemLabError::Invalid);
+        }
+        let state = unsafe { &mut *self.ctx.state };
+        let result = state.compare_exchange(STATE_READING, STATE_READY_TO_WRITE, SeqCst, SeqCst);
+        self.closed = true;
+        match result {
+            Err(_) => {
+                self.ctx.invalid = true;
+                Err(ShmemLabError::ConcurrentAccessDetected)
+            }
+            Ok(_) => Ok(()),
+        }
+    }
+}
+
+impl<'a, T> Deref for ShmemReceive<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.ctx.data }
+    }
+}
+
+impl<'a, T> Drop for ShmemReceive<'a, T> {
+    fn drop(&mut self) {
+        if !self.closed {
+            panic!("forgotten Sending handle detected");
+        }
     }
 }
 
 pub struct ShmemSender<T> {
-    pd: PhantomData<T>,
-    ctx: ShmemCtx,
+    ctx: ShmemCtx<T>,
+}
+
+pub struct ShmemSend<'a, T> {
+    pub ctx: &'a mut ShmemCtx<T>,
+    closed: bool,
+}
+
+impl<'a, T> ShmemSend<'a, T> {
+    pub fn end(mut self) -> Result<(), ShmemLabError> {
+        if self.ctx.invalid {
+            return Err(ShmemLabError::Invalid);
+        }
+        let state = unsafe { &mut *self.ctx.state };
+        let result = state.compare_exchange(STATE_WRITING, STATE_READY_TO_READ, SeqCst, SeqCst);
+        self.closed = true;
+        match result {
+            Err(_) => {
+                self.ctx.invalid = true;
+                Err(ShmemLabError::ConcurrentAccessDetected)
+            }
+            Ok(..) => Ok(()),
+        }
+    }
+}
+
+impl<'a, T> Deref for ShmemSend<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.ctx.data }
+    }
+}
+
+impl<'a, T> DerefMut for ShmemSend<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut (*self.ctx.data) }
+    }
+}
+
+impl<'a, T> Drop for ShmemSend<'a, T> {
+    fn drop(&mut self) {
+        if !self.closed {
+            panic!("forgotten Sending handle detected");
+        }
+    }
 }
 
 pub struct Stats {
@@ -75,29 +190,55 @@ pub struct Stats {
     pub receive_spins: Vec<u64>,
 }
 
-impl<T> ShmemSender<T> {
+impl<T: Copy> ShmemSender<T> {
     pub fn open(name: &str) -> ShmemSender<T> {
-        ShmemSender { pd: Default::default(), ctx: open_shmem(name, DEFAULT_SIZE) }
+        ShmemSender { ctx: open_shmem(name) }
     }
 
-    pub fn send(&self, value: T, timeout: Timeout) -> Result<Success<()>, ShmemLabError> {
-        let timeout_at = match timeout {
-            Timeout::Infinite => None,
-            Timeout::Val(dur) => Some(SystemTime::now() + dur)
-        };
-        let state = unsafe { &mut *self.ctx.state };
-        let mut spin_count = 0;
-        while state.load(SeqCst) != STATE_READY_TO_WRITE {
-            if let Some(at) = timeout_at {
-                if SystemTime::now() > at {
-                    return Err(ShmemLabError::Timeout);
+    pub fn begin(&mut self, timeout: Timeout) -> SpinResult<Result<ShmemSend<T>, ShmemLabError>> {
+        if self.ctx.invalid {
+            return SpinResult { value: Err(ShmemLabError::Invalid), spin_count: 0 };
+        } else {
+            let timeout_at = match timeout {
+                Timeout::Infinite => None,
+                Timeout::Val(dur) => Some(SystemTime::now() + dur)
+            };
+            let state = unsafe { &mut *self.ctx.state };
+            let mut spin_count = 0;
+            let mut backtrace_at = Some(SystemTime::now() + Duration::from_secs_f64(BACKTRACE_STUCK_SECS));
+            loop {
+                let curr_state = state.load(SeqCst);
+                if curr_state == STATE_READY_TO_WRITE {
+                    break;
                 }
+                if let Some(at) = timeout_at {
+                    if SystemTime::now() > at {
+                        return SpinResult {
+                            value: Err(ShmemLabError::Timeout),
+                            spin_count,
+                        };
+                    }
+                }
+
+                if spin_count % 10000 == 0 {
+                    let backtrace = if let Some(backtrace_at) = &backtrace_at {
+                        SystemTime::now() > *backtrace_at
+                    } else { false };
+                    if backtrace {
+                        println!("stuck at {}:\n{}", curr_state, Backtrace::capture());
+                        backtrace_at = None;
+                    }
+                }
+                spin_count += 1;
             }
-            spin_count += 1;
+            SpinResult {
+                value: match state.compare_exchange(STATE_READY_TO_WRITE, STATE_WRITING, SeqCst, SeqCst) {
+                    Ok(_) => Ok(ShmemSend { ctx: &mut self.ctx, closed: false }),
+                    Err(..) => Err(ShmemLabError::ConcurrentAccessDetected),
+                },
+                spin_count,
+            }
         }
-        *unsafe { &mut *(self.ctx.data as *mut T) } = value;
-        state.store(STATE_READY_TO_READ, SeqCst);
-        Ok(Success { value: (), spin_count })
     }
 }
 
@@ -110,21 +251,29 @@ fn do_sleep(d: Duration) {
     }
 }
 
-fn open_shmem(name: &str, size: usize) -> ShmemCtx {
-    let shmem = match ShmemConf::new().size(size).flink(name).create() {
+fn open_shmem<T: Copy>(name: &str) -> ShmemCtx<T> {
+    let size = mem::size_of::<T>() + 8;
+    let result = ShmemConf::new()
+        .size(size)
+        .flink(name)
+        .create();
+    let shmem = match result {
         Ok(m) => m,
-        Err(ShmemError::LinkExists) => ShmemConf::new().flink(name).open().unwrap(),
+        Err(ShmemError::LinkExists) => ShmemConf::new()
+            .flink(name)
+            .open()
+            .unwrap(),
         Err(e) => {
             panic!("Unable to create or open shmem flink {} : {}", name, e)
         }
     };
 
-    let mut data = shmem.as_ptr();
+    let data: *mut T;
     let state: *mut AtomicU64;
 
     unsafe {
-        state = &mut *(data as *mut AtomicU64);
-        data = data.add(8);
+        state = &mut *(shmem.as_ptr() as *mut AtomicU64);
+        data = &mut *(shmem.as_ptr().add(8) as *mut T);
     };
     loop {
         let state = unsafe { &mut *state };
@@ -147,5 +296,7 @@ fn open_shmem(name: &str, size: usize) -> ShmemCtx {
         shmem,
         state,
         data,
+        size,
+        invalid: false,
     }
 }

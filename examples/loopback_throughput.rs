@@ -12,7 +12,7 @@ use raw_sync::Timeout::Infinite;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thousands::Separable;
 use latency_lab::shmem_lab::{ShmemReceiver, ShmemSender, Stats};
-use latency_lab::shmem_ping::{shmem_ping_receive, shmem_ping_send};
+use latency_lab::shmem_ping::{MESSAGE_SHMEM_SIZE, shmem_ping_receive, shmem_ping_send};
 use latency_lab::utils::{PingMessage, read_u32_le, write_u32_le};
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]
@@ -29,8 +29,9 @@ fn main() {
     let iterations = 12000;
     //{"sent_at":{"secs_since_epoch":1688901474,"nanos_since_epoch":490919000}}
     test("Just ser+deser  ", iterations, || PingLocalSerde);
-    test("shmem in-process", iterations, || ShmemSerdePing::new_in_process("loopback_thoughput_shmem_in_process"));
+    // test("shmem in-process", iterations, || ShmemSerdePing::new_in_process("loopback_thoughput_shmem_in_process"));
     test("shmem x-process ", iterations, || ShmemSerdePing::new("shmem_ping_server_input", "shmem_ping_server_output"));
+    test("shmem x-p batch ", iterations, || ShmemBatchSerdePing::new("shmem_batch_ping_server_input", "shmem_batch_ping_server_output"));
     // test("JSON + loopback async direct        ", iterations, || PingLoopbackSerde::new(true, false, None));
     // test("JSON + loopback async buffered      ", iterations, || PingLoopbackSerde::new(false, false, None));
     test("buffered unlim  ", iterations, || PingLoopbackSerde::new(buffering, true, None, transport_loopback()));
@@ -433,24 +434,22 @@ fn write_message<W: Write>(mut server_socket: &mut W, m: &Message) -> std::io::R
     server_socket.write_all(json.as_bytes())
 }
 
-const MESSAGE_SHMEM_SIZE: usize = 512;
-
 struct ShmemSerdePing {
-    sender: ShmemSender<[u8; MESSAGE_SHMEM_SIZE]>,
-    receiver: ShmemReceiver<[u8; MESSAGE_SHMEM_SIZE]>,
+    send: String,
+    receive: String,
 }
 
 impl ShmemSerdePing {
     fn new_in_process(name: &str) -> ShmemSerdePing {
         ShmemSerdePing {
-            sender: ShmemSender::open(name),
-            receiver: ShmemReceiver::open(name),
+            send: name.to_string(),
+            receive: name.to_string(),
         }
     }
     fn new(send: &str, receive: &str) -> ShmemSerdePing {
         ShmemSerdePing {
-            sender: ShmemSender::open(send),
-            receiver: ShmemReceiver::open(receive),
+            send: send.to_string(),
+            receive: receive.to_string(),
         }
     }
 }
@@ -458,10 +457,12 @@ impl ShmemSerdePing {
 
 impl Ping for ShmemSerdePing {
     fn do_job(&mut self, stats: &mut Vec<Duration>, iterations: usize) {
+        let mut sender: ShmemSender<[u8; MESSAGE_SHMEM_SIZE]> = ShmemSender::open(self.send.as_str());
+        let mut receiver: ShmemReceiver<[u8; MESSAGE_SHMEM_SIZE]> = ShmemReceiver::open(self.receive.as_str());
         let mut shmem_stats = Stats { send_spins: vec![], receive_spins: vec![] };
         for i in 0..iterations {
-            shmem_ping_send(&PingMessage::new(), &self.sender, Some(&mut shmem_stats));
-            let response = shmem_ping_receive(&self.receiver, Some(&mut shmem_stats));
+            shmem_ping_send(&PingMessage::new(), &mut sender, Some(&mut shmem_stats));
+            let response: PingMessage = shmem_ping_receive(&mut receiver, Some(&mut shmem_stats));
             stats.push(SystemTime::now().duration_since(response.sent_at).unwrap());
         }
 
@@ -482,4 +483,52 @@ fn print_spin_stats(kind: &str, spins: &mut Vec<u64>) {
         spins.get(spins.len() / 2).unwrap(),
         spins.get((spins.len() as f64 * 0.95) as usize).unwrap(),
     )
+}
+
+struct ShmemBatchSerdePing {
+    send: String,
+    receive: String,
+}
+
+impl ShmemBatchSerdePing {
+    fn new(send: &str, receive: &str) -> ShmemBatchSerdePing {
+        ShmemBatchSerdePing {
+            send: send.to_string(),
+            receive: receive.to_string(),
+        }
+    }
+}
+
+impl Ping for ShmemBatchSerdePing {
+    fn do_job(&mut self, stats: &mut Vec<Duration>, iterations: usize) {
+        let mut shmem_sender: ShmemSender<[u8; MESSAGE_SHMEM_SIZE]> = ShmemSender::open(self.send.as_str());
+        let batch_read = {
+            let receive_name = self.receive.clone();
+            spawn("shmem batch reader", move || {
+                let mut shmem_receiver: ShmemReceiver<[u8; MESSAGE_SHMEM_SIZE]> = ShmemReceiver::open(receive_name.as_str());
+                let mut stats = Vec::new();
+                loop {
+                    let batch: Option<Vec<PingMessage>> = shmem_ping_receive(&mut shmem_receiver, None);
+                    if let Some(batch) = batch {
+                        for m in batch {
+                            stats.push(SystemTime::now().duration_since(m.sent_at).unwrap());
+                        }
+                    } else {
+                        return stats;
+                    }
+                }
+            })
+        };
+        let batch_size = 100;
+        for i in 0..(iterations / batch_size) {
+            let mut batch = Vec::with_capacity(batch_size);
+            for j in 0..batch_size {
+                batch.push(PingMessage::new());
+            }
+            shmem_ping_send(&Some(batch), &mut shmem_sender, None);
+        }
+        shmem_ping_send(&Option::<Vec<PingMessage>>::None, &mut shmem_sender, None);
+
+        *stats = batch_read.join().unwrap();
+    }
 }

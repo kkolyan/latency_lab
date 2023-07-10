@@ -195,7 +195,7 @@ impl ShmemSerdePing {
 
 impl Ping for ShmemSerdePing {
     fn ping(&mut self, m: PingMessage) -> PingMessage {
-        shmem_ping_send(&m, &self.sender, None);
-        shmem_ping_receive(&self.receiver, None)
+        shmem_ping_send(&m, &mut self.sender, None);
+        shmem_ping_receive(&mut self.receiver, None)
     }
 }
