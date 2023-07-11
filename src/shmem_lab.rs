@@ -1,4 +1,5 @@
 use std::backtrace::Backtrace;
+use std::cell::{Cell, RefCell};
 use std::io::{stdout, Write};
 use std::mem;
 use std::ops::{Deref, DerefMut};
@@ -9,6 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use raw_sync::Timeout;
 use shared_memory::{Shmem, ShmemConf, ShmemError};
+use crate::spin_counter::SpinCounter;
 
 const BACKTRACE_STUCK_SECS: f64 = 3.0;
 
@@ -39,26 +41,21 @@ pub enum ShmemLabError {
     Invalid,
 }
 
-pub struct SpinResult<T> {
-    pub value: T,
-    pub spin_count: u64,
-}
-
 impl<T: Copy> ShmemReceiver<T> {
     pub fn open(name: &str) -> ShmemReceiver<T> {
         ShmemReceiver { ctx: open_shmem(name) }
     }
 
-    pub fn begin(&mut self, timeout: Timeout) -> SpinResult<Result<ShmemReceive<T>, ShmemLabError>> {
+    pub fn begin(&mut self, timeout: Timeout) -> Result<ShmemReceive<T>, ShmemLabError> {
         if self.ctx.invalid {
-            return SpinResult { value: Err(ShmemLabError::Invalid), spin_count: 0 };
+            return Err(ShmemLabError::Invalid);
         }
         let timeout_at = match timeout {
             Timeout::Infinite => None,
             Timeout::Val(dur) => Some(SystemTime::now() + dur)
         };
         let state = unsafe { &mut *self.ctx.state };
-        let mut spin_count: u64 = 0;
+        let mut spin_count = SpinCounter::new();
         let mut backtrace_at = Some(SystemTime::now() + Duration::from_secs_f64(BACKTRACE_STUCK_SECS));
         loop {
             let curr_state = state.load(SeqCst);
@@ -67,14 +64,11 @@ impl<T: Copy> ShmemReceiver<T> {
             }
             if let Some(at) = timeout_at {
                 if SystemTime::now() > at {
-                    return SpinResult {
-                        value: Err(ShmemLabError::Timeout),
-                        spin_count,
-                    };
+                    return Err(ShmemLabError::Timeout);
                 }
             }
 
-            if spin_count % 10000 == 0 {
+            if spin_count.get() % 10000 == 0 {
                 let backtrace = if let Some(backtrace_at) = &backtrace_at {
                     SystemTime::now() > *backtrace_at
                 } else { false };
@@ -84,15 +78,12 @@ impl<T: Copy> ShmemReceiver<T> {
                 }
             }
 
-            spin_count += 1;
+            spin_count.inc();
         }
 
-        SpinResult {
-            value: match state.compare_exchange(STATE_READY_TO_READ, STATE_READING, SeqCst, SeqCst) {
-                Ok(_) => Ok(ShmemReceive { ctx: &mut self.ctx, closed: false }),
-                Err(..) => Err(ShmemLabError::ConcurrentAccessDetected),
-            },
-            spin_count,
+        match state.compare_exchange(STATE_READY_TO_READ, STATE_READING, SeqCst, SeqCst) {
+            Ok(_) => Ok(ShmemReceive { ctx: &mut self.ctx, closed: false }),
+            Err(..) => Err(ShmemLabError::ConcurrentAccessDetected),
         }
     }
 }
@@ -195,16 +186,16 @@ impl<T: Copy> ShmemSender<T> {
         ShmemSender { ctx: open_shmem(name) }
     }
 
-    pub fn begin(&mut self, timeout: Timeout) -> SpinResult<Result<ShmemSend<T>, ShmemLabError>> {
+    pub fn begin(&mut self, timeout: Timeout) -> Result<ShmemSend<T>, ShmemLabError> {
         if self.ctx.invalid {
-            return SpinResult { value: Err(ShmemLabError::Invalid), spin_count: 0 };
+            return Err(ShmemLabError::Invalid);
         } else {
+            let mut spin_counter = SpinCounter::new();
             let timeout_at = match timeout {
                 Timeout::Infinite => None,
                 Timeout::Val(dur) => Some(SystemTime::now() + dur)
             };
             let state = unsafe { &mut *self.ctx.state };
-            let mut spin_count = 0;
             let mut backtrace_at = Some(SystemTime::now() + Duration::from_secs_f64(BACKTRACE_STUCK_SECS));
             loop {
                 let curr_state = state.load(SeqCst);
@@ -213,14 +204,11 @@ impl<T: Copy> ShmemSender<T> {
                 }
                 if let Some(at) = timeout_at {
                     if SystemTime::now() > at {
-                        return SpinResult {
-                            value: Err(ShmemLabError::Timeout),
-                            spin_count,
-                        };
+                        return Err(ShmemLabError::Timeout);
                     }
                 }
 
-                if spin_count % 10000 == 0 {
+                if spin_counter.get() % 10000 == 0 {
                     let backtrace = if let Some(backtrace_at) = &backtrace_at {
                         SystemTime::now() > *backtrace_at
                     } else { false };
@@ -229,14 +217,11 @@ impl<T: Copy> ShmemSender<T> {
                         backtrace_at = None;
                     }
                 }
-                spin_count += 1;
+                spin_counter.inc();
             }
-            SpinResult {
-                value: match state.compare_exchange(STATE_READY_TO_WRITE, STATE_WRITING, SeqCst, SeqCst) {
-                    Ok(_) => Ok(ShmemSend { ctx: &mut self.ctx, closed: false }),
-                    Err(..) => Err(ShmemLabError::ConcurrentAccessDetected),
-                },
-                spin_count,
+            match state.compare_exchange(STATE_READY_TO_WRITE, STATE_WRITING, SeqCst, SeqCst) {
+                Ok(_) => Ok(ShmemSend { ctx: &mut self.ctx, closed: false }),
+                Err(..) => Err(ShmemLabError::ConcurrentAccessDetected),
             }
         }
     }
