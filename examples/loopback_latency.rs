@@ -15,11 +15,11 @@ use latency_lab::utils::PingMessage;
 
 
 fn main() {
-    let iterations = 10000;
-    test("json            ", iterations, || PingLocalSerde);
-    // test("Ping loopback serde json w/flush ", iterations, || PingLoopbackSerde::new(true));
+    let iterations = 100000;
+    test("json    ", iterations, || PingLocalSerde);
+    test("loopback", iterations, || PingLoopbackSerde::new(true));
     test("wo/flush", iterations, || PingLoopbackSerde::new(false));
-    // test("pipes   ", iterations, || PingStdPipesSerde::new());
+    test("pipes   ", iterations, || PingStdPipesSerde::new());
     test("shmem   ", iterations, || ShmemSerdePing::new(
         "shmem_ping_server_input.shmem",
         "shmem_ping_server_output.shmem"
@@ -44,7 +44,7 @@ fn test<T: Ping, F: FnOnce() -> T>(name: &str, iterations: usize, factory: F) {
     let med = stat.get(stat.len() / 2).unwrap();
     let pct95 = stat.get(((stat.len() as f64) * 0.95) as usize).unwrap();
     let pct05 = stat.get(((stat.len() as f64) * 0.05) as usize).unwrap();
-    println!("Test \"{}\": {}..{}, avg: {}, med: {}, pct-95: {}, pct-05: {}", name, min.as_nanos(), max.as_nanos(), avg.as_nanos(), med.as_nanos(), pct95.as_nanos(), pct05.as_nanos());
+    println!("Test \"{}\": {:>12}..{:>12}, avg: {:>12}, med: {:>12}, pct-95: {:>12}, pct-05: {:>12}", name, min.as_nanos(), max.as_nanos(), avg.as_nanos(), med.as_nanos(), pct95.as_nanos(), pct05.as_nanos());
 }
 
 trait Ping {
@@ -149,7 +149,7 @@ struct PingStdPipesSerde {
 
 impl PingStdPipesSerde {
     fn new() -> Self {
-        let std::process::Child { stdin, stdout, .. } = match Command::new("C:/dev/rust/reactex/latency_lab/target/debug/examples/ping_cli.exe")
+        let std::process::Child { stdin, stdout, .. } = match Command::new("C:/dev/rust/latency_lab/target/debug/examples/ping_cli.exe")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn() {

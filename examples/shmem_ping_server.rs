@@ -15,3 +15,4 @@ fn main() {
         shmem_ping_send(&ping_message, &mut sender, None);
     }
 }
+

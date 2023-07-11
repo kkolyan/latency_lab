@@ -1,12 +1,7 @@
 use std::io::{BufReader, BufWriter, Read, stdin, Stdin, stdout, Stdout, Write};
 use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
-
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
-struct Message {
-    index: u32,
-    sent: SystemTime,
-}
+use latency_lab::utils::PingMessage;
 
 fn main() {
     let mut stdin = BufReader::new(stdin());
@@ -22,14 +17,14 @@ fn main() {
     }
 }
 
-fn read_message<R: Read>(mut server_socket: &mut R) -> Result<Message, String> {
+fn read_message<R: Read>(mut server_socket: &mut R) -> Result<PingMessage, String> {
     let n = read_u32_le(&mut server_socket)
         .map_err(|e| e.to_string())?;
-    serde_json::from_reader::<_, Message>(server_socket.take(n.into()))
+    serde_json::from_reader::<_, PingMessage>(server_socket.take(n.into()))
         .map_err(|e| e.to_string())
 }
 
-fn write_message<W: Write>(mut server_socket: &mut W, m: &Message) -> std::io::Result<()> {
+fn write_message<W: Write>(mut server_socket: &mut W, m: &PingMessage) -> std::io::Result<()> {
     let json = serde_json::to_string(&m).unwrap();
     write_u32_le(&mut server_socket, json.len() as u32);
     server_socket.write_all(json.as_bytes())
