@@ -21,8 +21,8 @@ fn main() {
     test("wo/flush", iterations, || PingLoopbackSerde::new(false));
     // test("pipes   ", iterations, || PingStdPipesSerde::new());
     test("shmem   ", iterations, || ShmemSerdePing::new(
-        "shmem_ping_server_input",
-        "shmem_ping_server_output"
+        "shmem_ping_server_input.shmem",
+        "shmem_ping_server_output.shmem"
     ));
 }
 

@@ -30,8 +30,8 @@ fn main() {
     //{"sent_at":{"secs_since_epoch":1688901474,"nanos_since_epoch":490919000}}
     test("Just ser+deser  ", iterations, || PingLocalSerde);
     // test("shmem in-process", iterations, || ShmemSerdePing::new_in_process("loopback_thoughput_shmem_in_process"));
-    test("shmem x-process ", iterations, || ShmemSerdePing::new("shmem_ping_server_input", "shmem_ping_server_output"));
-    test("shmem x-p batch ", iterations, || ShmemBatchSerdePing::new("shmem_batch_ping_server_input", "shmem_batch_ping_server_output"));
+    test("shmem x-process ", iterations, || ShmemSerdePing::new("shmem_ping_server_input.shmem", "shmem_ping_server_output.shmem"));
+    test("shmem x-p batch ", iterations, || ShmemBatchSerdePing::new("shmem_batch_ping_server_input.shmem", "shmem_batch_ping_server_output.shmem"));
     // test("JSON + loopback async direct        ", iterations, || PingLoopbackSerde::new(true, false, None));
     // test("JSON + loopback async buffered      ", iterations, || PingLoopbackSerde::new(false, false, None));
     test("buffered unlim  ", iterations, || PingLoopbackSerde::new(buffering, true, None, transport_loopback()));

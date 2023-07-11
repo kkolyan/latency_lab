@@ -5,10 +5,10 @@ use latency_lab::shmem_ping::{MESSAGE_SHMEM_SIZE, shmem_ping_receive, shmem_ping
 use latency_lab::utils::PingMessage;
 
 fn main() {
-    remove_file("shmem_batch_ping_server_input");
-    remove_file("shmem_batch_ping_server_output");
-    let mut sender: ShmemSender<[u8; MESSAGE_SHMEM_SIZE]> = ShmemSender::open("shmem_batch_ping_server_output");
-    let mut receiver: ShmemReceiver<[u8; MESSAGE_SHMEM_SIZE]> = ShmemReceiver::open("shmem_batch_ping_server_input");
+    remove_file("shmem_batch_ping_server_input.shmem");
+    remove_file("shmem_batch_ping_server_output.shmem");
+    let mut sender: ShmemSender<[u8; MESSAGE_SHMEM_SIZE]> = ShmemSender::open("shmem_batch_ping_server_output.shmem");
+    let mut receiver: ShmemReceiver<[u8; MESSAGE_SHMEM_SIZE]> = ShmemReceiver::open("shmem_batch_ping_server_input.shmem");
 
     loop {
         let ping_message: Option<Vec<PingMessage>> = shmem_ping_receive(&mut receiver, None);
