@@ -149,7 +149,7 @@ struct PingStdPipesSerde {
 
 impl PingStdPipesSerde {
     fn new() -> Self {
-        let std::process::Child { stdin, stdout, .. } = match Command::new("C:/dev/rust/latency_lab/target/debug/examples/ping_cli.exe")
+        let std::process::Child { stdin, stdout, .. } = match Command::new("target/debug/examples/ping_cli.exe")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn() {
